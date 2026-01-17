@@ -1,0 +1,32 @@
+name: deep_sight
+description: A new Flutter project for DeepSight AI.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Latest stable version for 2026
+  google_generative_ai: ^0.4.7
+  # Upgraded to avoid the 'http' version conflict
+  audioplayers: ^6.1.0 
+  camera: ^0.11.0
+  flutter_tts: ^4.2.2
+  flutter_dotenv: ^6.0.0
+  vibration: ^3.1.5
+  # Ensure http is at a version compatible with both
+  http: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - .env
+    - assets/beep.mp3
