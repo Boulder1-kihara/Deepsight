@@ -1,5 +1,5 @@
 name: deep_sight
-description: A new Flutter project for DeepSight AI.
+description: A spatial safety assistant for the visually impaired.
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,24 +9,22 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # Latest stable version for 2026
-  google_generative_ai: ^0.4.7
-  # Upgraded to avoid the 'http' version conflict
-  audioplayers: ^6.1.0 
-  camera: ^0.11.0
-  flutter_tts: ^4.2.2
-  flutter_dotenv: ^6.0.0
-  vibration: ^3.1.5
-  # Ensure http is at a version compatible with both
-  http: ^1.2.0
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^6.0.0
+  # AI SDK: Version 0.4.5+ supports correct systemInstruction and v1beta handling [25]
+  google_generative_ai: ^0.4.5
+  # Camera: Version 0.11.0+ includes fixes for Android 14 concurrency issues [26]
+  camera: ^0.11.0 
+  # Audio: Version 6.0.0+ resolves some iOS AVPlayer conflicts [20]
+  audioplayers: ^6.0.0
+  # Haptics
+  vibration: ^1.9.0
+  # State Management & Utils
+  flutter_tts: ^4.0.2
+  flutter_dotenv: ^5.1.0
+  permission_handler: ^11.3.0 # Critical for Android 13/14 granular permissions
+  path_provider: ^2.1.2
 
 flutter:
   uses-material-design: true
   assets:
     - .env
-    - assets/beep.mp3
+    - assets/beep.mp3 # Ensure this file exists!

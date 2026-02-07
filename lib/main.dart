@@ -1,38 +1,52 @@
+// lib/main.dart
 import 'dart:async';
-import 'dart:typed_data';
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
-import 'package:flutter_tts/flutter_tts.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:vibration/vibration.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:audioplayers/audioplayers.dart';
-
-late List<CameraDescription> cameras;
+import 'package:vibration/vibration.dart';
+import 'deep_sight_manager.dart';
 
 Future<void> main() async {
+  // 1. Critical Bindings
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 2. Load Environment Variables
   try {
     await dotenv.load(fileName: ".env");
   } catch (e) {
-    debugPrint("Warning: .env file missing: $e");
+    debugPrint(
+        "Warning: .env file not found. Using fallback or expecting hardcoded key.");
   }
-  try {
-    cameras = await availableCameras();
-  } catch (e) {
-    cameras = [];
-  }
+
+  // 3. Lock Orientation (Prevents camera re-init crashes on rotation)
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
+
   runApp(const DeepSightApp());
 }
 
 class DeepSightApp extends StatelessWidget {
   const DeepSightApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'DeepSight AI',
-      theme: ThemeData.dark(),
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: Colors.black,
+        colorScheme: const ColorScheme.dark(
+          primary: Colors.blueAccent,
+          secondary: Colors.amber,
+          error: Colors.redAccent,
+        ),
+      ),
       home: const DeepSightScreen(),
     );
   }
@@ -40,207 +54,222 @@ class DeepSightApp extends StatelessWidget {
 
 class DeepSightScreen extends StatefulWidget {
   const DeepSightScreen({super.key});
+
   @override
   State<DeepSightScreen> createState() => _DeepSightScreenState();
 }
 
-class _DeepSightScreenState extends State<DeepSightScreen> {
-  late CameraController _cameraController;
-  GenerativeModel? _model;
+class _DeepSightScreenState extends State<DeepSightScreen>
+    with WidgetsBindingObserver {
+  final DeepSightManager _manager = DeepSightManager();
   final FlutterTts _flutterTts = FlutterTts();
   final AudioPlayer _audioPlayer = AudioPlayer();
-  
-  bool _isProcessing = false;
-  bool _isCameraInitialized = false;
-  bool _isBatterySaver = false;
-  String _currentAdvice = "Initializing DeepSight...";
-  String _lastSpokenAdvice = "";
-  Timer? _beepTimer;
 
-  bool get _isDanger => _currentAdvice.toUpperCase().contains("DANGER");
-
-  // System Instructions to be injected into the prompt
-  final String _systemInstruction = """
-  You are a Spatial Safety Assistant for the blind. 
-  Detect holes, drops, or obstacles. Estimate distance in steps or meters.
-  Format strictly as: [DANGER_LEVEL] : [Direction] - [Distance]
-  """;
+  Timer? _scanTimer;
+  bool _isDanger = false;
+  bool _userInitiated = false;
+  DateTime _lastSpoken = DateTime.now();
 
   @override
   void initState() {
     super.initState();
-    _initializeGemini();
-    _initializeTTS();
-    _initializeCamera();
+    WidgetsBinding.instance.addObserver(this);
+    _initializeSystem();
   }
 
-  void _initializeGemini() {
-    final apiKey = dotenv.env['GEMINI_API_KEY'];
-    if (apiKey == null) return;
-
-    _model = GenerativeModel(
-      // Using the fully qualified stable model name for V1
-      model: 'gemini-1.5-flash-latest', 
-      apiKey: apiKey,
-      // Removed systemInstruction to fix "Unknown name" error
-      requestOptions: const RequestOptions(apiVersion: 'v1'),
-    );
+  Future<void> _initializeSystem() async {
+    // Manager Initialization
+    final apiKey = dotenv.env['GEMINI_API_KEY'] ?? '';
+    await _manager.initialize(apiKey);
+    setState(() {}); // Refresh UI
   }
 
-  void _initializeTTS() {
-    _flutterTts.setLanguage("en-US");
-    _flutterTts.setSpeechRate(0.5);
-  }
+  void _startScanning() {
+    if (_scanTimer != null && _scanTimer!.isActive) return;
 
-  Future<void> _initializeCamera() async {
-    if (cameras.isEmpty) return;
-    _cameraController = CameraController(cameras[0], ResolutionPreset.medium, enableAudio: false);
-    try {
-      await _cameraController.initialize();
-      if (!mounted) return;
-      setState(() => _isCameraInitialized = true);
-      _analyzeFrame();
-    } catch (e) {
-      debugPrint("Camera error: $e");
-    }
-  }
-
-  Future<void> _analyzeFrame() async {
-    if (!mounted || !_isCameraInitialized || _isProcessing) return;
-    if (_model == null) return;
-
-    setState(() => _isProcessing = true);
-
-    try {
-      final XFile imageFile = await _cameraController.takePicture();
-      final Uint8List imageBytes = await imageFile.readAsBytes();
-
-      final content = [
-        Content.multi([
-          // Injecting instructions directly into the message for V1 Stable
-          TextPart("INSTRUCTION: $_systemInstruction\n" 
-                   "USER REQUEST: Analyze ground safety. Mention holes and distance."),
-          DataPart('image/jpeg', imageBytes),
-        ])
-      ];
-
-      final response = await _model!.generateContent(content).timeout(const Duration(seconds: 5));
-      final text = response.text ?? "SAFE : Path clear";
-
-      if (mounted) {
-        setState(() => _currentAdvice = text);
-        await _speak(text);
+    // Scan every 2.5 seconds
+    _scanTimer =
+        Timer.periodic(const Duration(milliseconds: 2500), (timer) async {
+      if (_manager.status == DeepSightStatus.ready && _userInitiated) {
+        await _manager.analyzeFrame();
+        _processAdvice(_manager.advice);
       }
-    } catch (e) {
-      debugPrint("API Error: $e"); 
-      setState(() => _currentAdvice = "CAUTION : Scanning...");
-    } finally {
-      if (mounted) {
-        setState(() => _isProcessing = false);
-        // Delay to prevent 429 rate limit errors
-        await Future.delayed(Duration(milliseconds: _isBatterySaver ? 4000 : 1500));
-        _analyzeFrame();
-      }
-    }
-  }
-
-  void _startBeeping(String text) {
-    _beepTimer?.cancel();
-    if (!text.toUpperCase().contains("DANGER")) return;
-
-    int ms = 1000;
-    if (text.contains("1 step")) ms = 250;
-    else if (text.contains("2 step")) ms = 500;
-
-    _beepTimer = Timer.periodic(Duration(milliseconds: ms), (timer) {
-      _audioPlayer.play(AssetSource('beep.mp3'));
-      Future.delayed(const Duration(seconds: 2), () => timer.cancel());
     });
   }
 
-  Future<void> _speak(String text) async {
-    if (text == _lastSpokenAdvice) return;
-    _lastSpokenAdvice = text;
+  Future<void> _enableSystem() async {
+    setState(() => _userInitiated = true);
 
-    _startBeeping(text);
-    String cleanText = text.replaceAll("[", "").replaceAll("]", "").replaceAll(":", ".");
+    // Web Audio Unlock
+    try {
+      if (kIsWeb) {
+        // Dummy speech to unlock
+        await _flutterTts.speak(" ");
+      }
+      await _flutterTts.setLanguage("en-US");
+      await _flutterTts.setSpeechRate(0.5);
+      await _flutterTts.setVolume(1.0);
+      await _flutterTts.awaitSpeakCompletion(true);
 
-    if (text.toUpperCase().contains("DANGER")) {
+      await _flutterTts.speak("DeepSight Active");
+    } catch (e) {
+      debugPrint("TTS init error: $e");
+    }
+
+    _startScanning();
+  }
+
+  Future<void> _processAdvice(String advice) async {
+    if (advice.contains("Initializing") || advice.contains("Retrying")) return;
+
+    // Logic to determine danger
+    final bool danger = advice.toUpperCase().contains("DANGER") ||
+        advice.toUpperCase().contains("CAUTION");
+
+    setState(() => _isDanger = danger);
+
+    // Audio Feedback Logic
+    if (danger) {
       if (await Vibration.hasVibrator() ?? false) {
-        Vibration.vibrate(pattern: [0, 500, 200, 500]);
+        Vibration.vibrate(pattern: [0, 500, 200, 500]); // SOS-like pattern
+      }
+      // Play beep using AssetSource
+      try {
+        await _audioPlayer.play(AssetSource('beep.mp3'),
+            mode: PlayerMode.lowLatency);
+      } catch (e) {
+        debugPrint("Audio Error: $e");
       }
     }
 
-    await _flutterTts.stop();
-    await _flutterTts.speak(cleanText);
-  }
-
-  void _triggerDemoHole() {
-    const simulated = "DANGER : Hole Ahead - 2 steps.";
-    setState(() => _currentAdvice = simulated);
-    _speak(simulated);
+    // TTS Debounce (Don't repeat too often)
+    if (DateTime.now().difference(_lastSpoken).inSeconds > 2 || danger) {
+      _lastSpoken = DateTime.now();
+      String cleanText = advice
+          .replaceAll("[", "")
+          .replaceAll("]", "")
+          .replaceAll(":", " is ");
+      await _flutterTts.speak(cleanText);
+    }
   }
 
   @override
   void dispose() {
-    _cameraController.dispose();
+    _scanTimer?.cancel();
+    _manager.disposeResources();
     _flutterTts.stop();
     _audioPlayer.dispose();
-    _beepTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  // Lifecycle handling to pause/resume camera usage
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_manager.cameraController == null ||
+        !_manager.cameraController!.value.isInitialized) return;
+
+    if (state == AppLifecycleState.inactive) {
+      _manager.cameraController?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      _manager.initialize(dotenv.env['GEMINI_API_KEY'] ?? '');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_isCameraInitialized) return const Scaffold(body: Center(child: CircularProgressIndicator()));
-
     return Scaffold(
-      body: Stack(
-        children: [
-          SizedBox.expand(child: CameraPreview(_cameraController)),
-          if (_isDanger) IgnorePointer(child: Container(color: Colors.red.withOpacity(0.4))),
-          
-          Positioned(
-            top: 50,
-            left: 20,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _triggerDemoHole,
-                  icon: const Icon(Icons.warning_amber),
-                  label: const Text("Demo Hole"),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
-                ),
-                const SizedBox(height: 10),
-                FilterChip(
-                  label: const Text("Battery Saver"),
-                  selected: _isBatterySaver,
-                  onSelected: (val) => setState(() => _isBatterySaver = val),
-                ),
-              ],
-            ),
-          ),
+      body: ListenableBuilder(
+        listenable: _manager,
+        builder: (context, child) {
+          // 1. Loading State
+          if (_manager.status == DeepSightStatus.initializing) {
+            return const Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 20),
+                  Text("Initializing DeepSight...",
+                      style: TextStyle(color: Colors.white)),
+                ],
+              ),
+            );
+          }
 
-          Positioned(
-            bottom: 40,
-            left: 20,
-            right: 20,
-            child: Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: Colors.black87,
-                borderRadius: BorderRadius.circular(15),
-                border: Border.all(color: _isDanger ? Colors.red : Colors.yellowAccent, width: 3),
+          // 2. Camera Failure State (Fallback UI)
+          if (_manager.status == DeepSightStatus.cameraFailure) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.error_outline,
+                      size: 60, color: Colors.amber),
+                  const SizedBox(height: 20),
+                  Text(_manager.advice),
+                  ElevatedButton(
+                    onPressed: () => _initializeSystem(),
+                    child: const Text("Retry Initialization"),
+                  )
+                ],
               ),
-              child: Text(
-                _currentAdvice,
-                style: TextStyle(color: _isDanger ? Colors.redAccent : Colors.yellowAccent, fontSize: 22, fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
+            );
+          }
+
+          // 3. Active State
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              // Camera Preview
+              if (_manager.cameraController != null &&
+                  _manager.cameraController!.value.isInitialized)
+                CameraPreview(_manager.cameraController!),
+
+              // Danger Overlay
+              if (_isDanger) Container(color: Colors.red.withOpacity(0.3)),
+
+              // Info Overlay
+              Positioned(
+                bottom: 50,
+                left: 20,
+                right: 20,
+                child: Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.black87,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                        color: _isDanger ? Colors.red : Colors.blueAccent),
+                  ),
+                  child: Text(
+                    _manager.advice,
+                    style: const TextStyle(color: Colors.white, fontSize: 18),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
               ),
-            ),
-          ),
-        ],
+
+              // Start Button Overlay (For User Interaction)
+              if (!_userInitiated && _manager.status == DeepSightStatus.ready)
+                Container(
+                  color: Colors.black54,
+                  child: Center(
+                    child: ElevatedButton.icon(
+                      onPressed: _enableSystem,
+                      icon: const Icon(Icons.power_settings_new),
+                      label: const Text("START DEEPSIGHT"),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 32, vertical: 20),
+                        backgroundColor: Colors.blueAccent,
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          );
+        },
       ),
     );
   }
